@@ -1,0 +1,851 @@
+const db = require("../models/index");
+const bodyCheck = require('../helpers/bodyCheck')
+const fs = require('fs');
+const bcrypt = require('bcryptjs');
+const sendEmail = require("../helpers/sendEmail");
+const imgConvert = require('../helpers/image-convert');
+const utils = require('../helpers/utils');
+const { Op, Sequelize } = require('sequelize');
+const path = require('path');
+const User = db.User;
+const Role = db.Role;
+const ValidToken = db.ValidToken;
+
+const projectRoot = path.resolve(__dirname, '../');
+
+const registerUser = async (req, res) => {
+    console.log("In registering: ", req.body);
+    let transaction = null;
+    try {
+        transaction = await db.sequelize.transaction(); // Start transaction
+        const bodyIsOk = await bodyCheck.registerBodyCheck(req.body);
+        console.log("bodyIsOk:", bodyIsOk, req.body);
+        if (!bodyIsOk) {
+            return res.status(400).json({ status: "failure", message: "Vérifiez vos champs et réessayez." });
+        };
+
+        let {nom, prenoms, email, password, password_confirmation, telephone, roleID } = req.body;
+        console.log(nom, prenoms, email, password, password_confirmation, telephone, roleID);
+
+        let organisationId = req.body.organisationId ? req.body.organisationId : null;
+        let organisation = null;
+
+        if (roleID == 3 && organisationId != null) {
+            organisation = await db.Organisation.findOne({ where: { id: organisationId }, transaction });
+        }
+        if (roleID == 3 && !organisation) {
+            return res.status(400).json({ status: "failure", message: "Pas d'organisation." });
+        }
+
+        console.log("Verifying Password");
+        // if (password !== password_confirmation) {
+        //     return res.status(400).json({ status: "failure", message: "Mot de passe pas confirmé" });
+        // }
+        if(!password) password = "EBNL@2025";
+        let role = await Role.findOne({ where: { id: roleID }, transaction });
+        console.log("Verifying the role");
+
+        let user = await User.findOne({ where: { email: email }, transaction });
+        if (user) {
+            console.log('Mail déjà pris ou ...');
+            return res.status(400).json({ status: "failure", message: "Mail déjà pris" });
+        }
+
+        const saltPass = await bcrypt.genSalt(12);
+        const hashPwd = await bcrypt.hash(password, saltPass);
+
+        const newUser = await User.create({
+            nom: nom,
+            prenoms: prenoms,
+            email: email,
+            password: hashPwd,
+            tel: telephone
+        }, { transaction });
+
+        console.log('User created');
+        await newUser.setRole(role, { transaction });
+        await role.addUsers(newUser, { transaction });
+        console.log('Association with role set');
+
+        if (organisationId != null) {
+            console.log('Setting organisation');
+            await newUser.setOrganisation(organisation, { transaction });
+        }
+
+        // Sending email
+        const params = {
+            name: newUser.prenoms + ' ' + newUser.nom,
+            username: newUser.email,
+            password: password,
+            url: process.env.APP_URL + '/login'
+        };
+        const mailOptions = {
+            to: newUser.email,
+            subject: "Finalisation de l'inscription"
+        };
+        await sendEmail(mailOptions, params, "register");
+
+        await transaction.commit(); // Commit transaction
+        console.log('Transaction completed successfully.');
+
+        return res.status(200).json({ status: "success", id: newUser.id, user: newUser });
+        
+    } catch (error) {
+        console.error('Error while processing user: ', error);
+        await transaction.rollback(); // Rollback transaction on error
+        return res.status(500).json({ status: "failure", message: "Un problème interne. Veuillez patienter." });
+    }
+};
+
+const loginLogic = async (email, password) => {
+    try {
+        console.log("Getting User: ", email);
+        let user = await User.findOne({
+            where: {
+                email: email,
+                disabled: false
+            },
+            include: [
+                {
+                    model: Role,
+                    as: 'role'
+                },
+                {
+                    model: db.Organisation,
+                    as: 'organisation'
+                }
+            ]
+        });
+
+        if (!user) {
+            return { status: "failure", message: "Nom d'utilisateur incorrect ou utilisateur désactivé." };
+        }
+
+        const nb_con = await ValidToken.count({
+            include: {
+                model: User,
+                as: 'tokenUser',
+                where: {
+                    id: user.id
+                }
+            }
+        });
+        console.log('Connexion: n', nb_con);
+        if (nb_con > 100) {
+            return { status: "failure", message: "Vous avez beaucoup de comptes actifs, déconnectez-vous de l'un." };
+        }
+
+        const isMatch = await bcrypt.compare(password, user.password);
+        if (!isMatch) {
+            return { status: "failure", message: "Nom d'utilisateur ou mot de passe incorrect." };
+        }
+
+        console.log(user.id);
+        const jwtToken = utils.signToken(user.id);
+        const refreshToken = utils.signRefreshToken(user.id);
+        if (jwtToken != 0) {
+            user.derniere_connexion = new Date();
+            const validToken = await ValidToken.create({
+                token: jwtToken
+            });
+            if (!validToken) {
+                return { status: "failure", message: "Un problème interne. Veuillez patienter." };
+            }
+
+            await validToken.setTokenUser(user);
+            await user.addTokens(validToken);
+
+            if (!await user.save()) {
+                return { status: "failure", message: "Un problème interne. Veuillez patienter." };
+            }
+
+            let status = utils.getStatus(user);
+            let userToSend = {
+                refreshToken: refreshToken,
+                user: {
+                    id: user.id,
+                    nom: user.nom,
+                    prenoms: user.prenoms,
+                    email: user.email,
+                    tel: user.tel,
+                    first_connect: user.first_connect,
+                    derniere_connexion: user.derniere_connexion,
+                    status: status,
+                    role: user.role.label,
+                    organisation: user.organisation
+                }
+            };
+
+            console.log('Before returning');
+            return { status: "success", token: jwtToken, userToSend };
+        }
+
+        return { status: "failure", message: "Une erreur s'est produite." };
+    } catch (error) {
+        console.log(error);
+        return { status: "failure", message: "Un problème interne. Veuillez patienter." };
+    }
+};
+
+const login = async (req, res) => {
+    console.log("IN login");
+    const bodyIsOk = await bodyCheck.loginBodyCheck(req.body);
+    if (!bodyIsOk) {
+        return res.status(400).json({ status: "failure", message: "Veuillez remplir tous les champs." });
+    }
+
+    const { email, password } = req.body;
+    const result = await loginLogic(email, password);
+
+    if (result.status === "success") {
+        return res.status(200).json(result);
+    } else {
+        return res.status(result.status === "failure" ? 400 : 500).json(result);
+    }
+};
+
+const handleToken = async (req, res) => {
+    const jwtToken = req.body.jwtToken; // Token d'accès extrait des cookies
+    const refreshTokenStored = req.body.refreshToken; // Refresh token extrait des cookies
+
+    console.log("Token d'accès extrait :", jwtToken);
+    console.log("Refresh token extrait :", refreshTokenStored);
+
+    // Vérifie si le token d'accès expire bientôt
+    if (await utils.isTokenExpiringSoon(jwtToken)) {
+        console.log("Le token d'accès expire bientôt, demande de nouveau token...");
+
+        // Si oui, demande un nouveau token en utilisant le refresh token
+        const newTokens = utils.refreshToken(refreshTokenStored);
+        console.log('New Refresh Token: ', newTokens)
+        if (newTokens) {
+            console.log("Nouveaux tokens reçus :", newTokens);
+
+            // Mets à jour les tokens dans les cookies
+            // res.cookie('jwtToken', newTokens.accessToken, { httpOnly: true, secure: false, maxAge: 3600000, sameSite: 'Lax', path: '/' });
+            // res.cookie('refreshToken', newTokens.refreshToken, { httpOnly: true, secure: false, maxAge: 604800000, sameSite: 'Lax', path: '/' }); // 7 jours
+
+            // Répondre au client avec un statut de succès
+            console.log("Tokens mis à jour dans les cookies.");
+            return res.status(200).json({
+                status: "success",
+                message: 'Tokens rafraîchis avec succès',
+                accessToken: newTokens.accessToken,
+                refreshToken: newTokens.refreshToken
+            });
+        } else {
+            console.log('Le refresh token est expiré ou invalide. L’utilisateur doit se reconnecter.');
+            return res.status(401).json({
+                status: "failure",
+                message: 'Session expirée, veuillez vous reconnecter.'
+            });
+        }
+    }
+
+    console.log("Le token d'accès est encore valide, aucune action requise.");
+    return res.status(200).json({
+        status: "success",
+        message: 'Le token est valide',
+        accessToken: jwtToken
+    });
+}
+
+const updateProfilePassword = async (req, res) => {
+    //requête d'un utilisateur par son identifiant avec inclusion de la relation "Role"
+    const bodyIsOk = await bodyCheck.updateProfilePasswordBodyCheck(req.body);
+    //console.log("bodyisOk:",bodyIsOk)
+    if (!bodyIsOk) {
+        res.status(400).json({status: "failure", message: "Remplissez tous les champs correctement"});
+    }
+    const {email, apassword, password, password_confirmation } = req.body;
+    if(password != password_confirmation) return res.status(400).json({status: "failure", message: "Username ou mot de passe incorrects"});
+    
+    try {
+        let user = await User.findOne({ 
+            where: {email: email},
+            include: {
+                model: db.Role, 
+                as: 'role', 
+                where: {
+                    libelle: { [Sequelize.Op.ne]: 'admin' }
+                }
+            }
+        });
+        if (!user) {
+            return res.status(400).json({status: "failure", message: "Email incorrect"});
+        } 
+        
+        const isMatch = await bcrypt.compare(apassword, user.password)
+        if(!isMatch){
+            return res.status(400).json({status: "failure", message: "Ancien mot de passe invalide"});
+        }
+        
+
+        const saltPass = await bcrypt.genSalt(12);
+        const hashPwd = await bcrypt.hash(password,saltPass)
+        
+        user.password = hashPwd;
+        if (user.first_connect == true) user.first_connect = false;
+        if(!user.save()) res.status(500).json({status: "failure", message: "Un problème lors de la mise à jour. Veuillez réessayer."});  
+        
+        return res.status(200).json({status: "success", id: user.id});
+    } catch (error) {
+        console.log("Error: ", error)
+        return res.status(500).json({status: "failure", message: "success"});  
+    }
+}   
+
+
+const disableUser = async (req, res) => {
+    try {
+        console.log("ID: ", req.body.id)
+        let id = req.body.id;
+        let user = await User.findByPk(id, {
+            where: {
+                disabled: false
+            },
+            include: {
+                model: db.Role, 
+                as: 'role', 
+                where: {
+                    libelle: { [Sequelize.Op.ne]: 'admin' }
+                }
+            }
+        });
+        if (user) {
+            user.disabled = true;
+            const saveResult = await user.save();
+            if (!saveResult) {
+                return res.status(500).json({ status: "failure", message: 'Erreur serveur: Impossible de désactiver l\'utilisateur.' });
+            }
+            return res.status(200).json({ status: "success", id: id });
+        } else {
+            return res.status(422).json({ status: "failure", message: "Utilisateur inconnu." });
+        }   
+    } catch (error) {
+        console.error(error);
+        return res.status(500).json({ status: "failure", message: "Erreur serveur." });
+    }
+}
+
+const ableUser = async (req, res) => {
+    let id = req.body.id;
+    try {
+        let user = await User.findByPk(id, {
+            include: {
+                model: db.Role, 
+                as: 'role', 
+                where: {
+                    libelle: { [Sequelize.Op.ne]: 'admin' }
+                }
+            }
+        });
+        if (user) {
+            user.disabled = false;
+            const saveResult = await user.save();
+            if (!saveResult) {
+                return res.status(500).json({ status: "failure", message: 'Erreur serveur: Impossible de réactiver l\'utilisateur.' });
+            }
+            return res.status(200).json({ status: "success", id: id, user });
+        } else {
+            return res.status(422).json({ status: "failure", message: "Utilisateur inconnu." });
+        }   
+    } catch (error) {
+        console.error(error);
+        return res.status(500).json({ status: "failure", message: "Erreur serveur." });
+    }
+}
+
+const logout = async (req, res) => {
+    console.log('In logout');
+    console.log(req.userId);
+    
+    try {
+        const valid = await ValidToken.findOne({
+            where: {
+                userID: req.userId,
+                token: req.token
+            }
+        });
+
+        if (valid) {
+            console.log('ValidToken found');
+            try {
+                await valid.destroy();
+                console.log('ValidToken successfully deleted');
+                return res.status(200).json({ status: "success", message: "Déconnexion réussie." });
+            } catch (error) {
+                console.error('Error deleting ValidToken:', error);
+                return res.status(405).json({ status: "failure", message: "Veuillez réessayer." });  
+            }
+        } else {
+            console.log('ValidToken not found for the given criteria');
+            return res.status(405).json({ status: "failure", message: "Veuillez vous connecter." });  
+        }
+    } catch (err) {
+        console.error(err);
+        return res.status(405).json({ status: "failure", message: "Un problème lors de la déconnexion. Veuillez réessayer." });  
+    }
+}
+
+const viewAllUsers = (req, res) => { 
+    User.findAll({
+        where: {
+            disabled: false
+        },
+        attributes: [
+            'id', 'nom', 'prenoms', 'email', 'tel', 'derniere_connexion',
+            [Sequelize.literal('CASE WHEN "disabled" = true THEN \'Bloqué\' ELSE \'Actif\' END'), 'status']
+        ],
+        include: [
+            {
+                model: db.Role,
+                as: 'role'
+            }
+        ],
+    }).then(users => { 
+        console.log(users);
+        return res.status(200).json({ status: "success", users });
+    }).catch(function (error) { 
+        console.error(error);
+        return res.status(500).json({ status: "failure", message: "Un problème lors de la récupération des utilisateurs." });  
+    });
+};
+
+
+const getRoles = async (req, res) => {
+    try {
+        // Récupération des rôles de la base de données
+        const roles = await db.Role.findAll(); // Remplacez par votre méthode de récupération
+
+        // Formatage de la réponse en cas de succès
+        return res.status(200).json({
+            status: 'success',
+            data: roles
+        });
+    } catch (error) {
+        console.error('Error fetching roles:', error);
+        
+        // Formatage de la réponse en cas d'échec
+        return res.status(500).json({
+            status: 'failure',
+            message: 'Erreur lors de la récupération des rôles'
+        });
+    }
+};
+
+
+const viewUser = (req, res) => {
+    // Requête d'un utilisateur par son identifiant avec inclusion de la relation "Role"
+    let id = req.params.id;
+    User.findOne({
+        attributes: [
+            'id', 'nom', 'prenoms', 'email', 'tel', 'derniere_connexion',
+            [Sequelize.literal('CASE WHEN "disabled" = true THEN \'Bloqué\' ELSE \'Actif\' END'), 'status']
+        ],
+        where: { id: id },
+        include: [
+            {
+                model: Role,
+                as: 'role'
+            }
+        ]
+    }).then(user => {
+        if (!user) {
+            return res.status(404).json({ status: "failure", message: "Veuillez envoyer un bon utilisateur." });  
+        }
+        return res.status(200).json({ status: "success", user });
+    }).catch(error => {
+        console.error(error);
+        return res.status(500).json({ status: "failure", message: "Un problème lors de la récupération de l'utilisateur." });  
+    });
+};
+
+// Fonction pour convertir une image en Base64
+const convertImageToBase64 = (imagePath) => {
+    console.log('In image converting: ', imagePath);
+    try {
+        const imageBuffer = fs.readFileSync(imagePath);
+        const base64Image = imageBuffer.toString('base64');
+        return base64Image;
+    } catch (error) {
+        console.error('Erreur lors de la conversion de l\'image en Base64 :', error);
+        return null;
+    }
+};
+
+const updateProfileInfo = async (req, res) => {
+    console.log("req.params.id: ", req.params.id);
+   
+    if (!req.body) {
+        return res.status(400).json({ status: "failure", message: "Aucune donnée fournie." });
+    }
+
+    const bodyIsOk = await bodyCheck.updateProfileBodyCheck(req.body);
+    if (!bodyIsOk) {
+        return res.status(400).json({ status: "failure", message: "Mauvaise requête." });
+    }
+
+    let user = await User.findOne({ where: { id: req.params.id, disabled: false } });
+    if (!user) {
+        return res.status(404).json({ status: "failure", message: "Utilisateur inconnu." });
+    }
+
+    const selector = { where: { id: req.params.id } };
+
+    User.update(req.body, selector).then(async (isUpdated) => {
+        if (isUpdated[0] !== 0) { 
+            console.log("Converting...");
+            var file = req.file;
+            if (file) {
+                console.log("Saving...");
+                const signature = convertImageToBase64(file.path);
+                user.signature = signature;
+                await user.save(); // Await the save operation
+            }
+            return res.status(200).json({ status: "success", id: req.params.id });
+        } else {
+            return res.status(422).json({ status: "failure", message: "Pas d'utilisateur modifié." });
+        } 
+    }).catch(error => {
+        console.error(error);
+        return res.status(500).json({ status: "failure", message: "Erreur serveur." });
+    });
+}
+
+const updateUserByAdmin = async (req, res) => {
+    const bodyIsOk = await bodyCheck.updateProfileBodyCheck(req.body);
+    if (!bodyIsOk) {
+        return res.status(400).json({ status: "failure", message: "Mauvaise requête." });
+    }
+
+    let user = await User.findOne({
+        where: { id: req.params.id }
+    });
+    if (!user) {
+        return res.status(404).json({ status: "failure", message: "Utilisateur inconnu." });
+    }
+    
+    const selector = { where: { id: req.params.id } };
+
+    User.update(req.body, selector).then(isUpdated => {
+        if (isUpdated[0] !== 0) {
+            return res.status(200).json({ status: "success", id: req.params.id });
+        } else {
+            return res.status(422).json({ status: "failure", message: "Utilisateur inconnu." });
+        } 
+    }).catch(error => {
+        console.error(error);
+        return res.status(500).json({ status: "failure", message: "Erreur serveur." });
+    });
+}
+
+const restoreUserPassword = async (req, res) => {
+    // const bodyIsOk = await bodyCheck.restorePasswordBodyCheck(req.body);
+    
+    // if (!bodyIsOk) {
+    //     return res.status(400).json({ status: "failure", message: "Envoyez tous les champs." }); 
+    // }
+
+    try {
+        const { id, email } = req.body;
+        const default_password = "EBNL@2025";
+        let user = await User.findOne({ 
+            where: { id, email }
+        });
+
+        if (!user) {
+            return res.status(400).json({ status: "failure", message: "Email invalide." });
+        } 
+
+        const saltPass = await bcrypt.genSalt(12);
+        const hashPwd = await bcrypt.hash(default_password, saltPass);
+        
+        user.password = hashPwd;
+        user.first_connect = true;
+
+        const saveResult = await user.save();
+        if (!saveResult) {
+            return res.status(500).json({ status: "failure", message: "Un problème lors de la mise à jour. Veuillez réessayer." });
+        }
+
+        return res.status(200).json({ status: "success", id: user.id, email: user.email });
+    } catch (error) {
+        console.error(error); // Log the error for debugging
+        return res.status(500).json({ status: "failure", message: "Un problème lors de la mise à jour. Veuillez réessayer." });
+    }
+};
+
+const check_login_code = async (req, res) => {
+    try {
+        const code = req.body.login_code;
+        let data = null;
+        const exist = await db.LoginCode.findOne({
+            where: {
+                code
+            }
+        });
+        
+        if (exist) {
+            data = exist;
+            // await db.LoginCode.destroy({
+            //     where: {
+            //         id: exist.id
+            //     }
+            // })
+            return res.status(200).json({
+                status: 'success',
+                message: 'Code de connexion valide.',
+                data 
+            });
+        } else {
+            return res.status(404).json({
+                status: 'failure',
+                message: 'Code de connexion invalide.'
+            });
+        }
+    } catch (error) {
+        console.error('Erreur lors de la vérification du code de connexion:', error);
+        return res.status(500).json({
+            status: 'failure',
+            message: 'Une erreur est survenue lors du traitement de votre demande.'
+        });
+    }
+};
+
+const send_otp = async (req, res) => {
+    try {
+        const email = req.body.email;
+
+        // Vérifier si l'email de l'organisation existe
+        const organization = await db.Organisation.findOne({
+            where: { email },
+            include: {
+                model: db.Status,
+                as: 'statutIn',
+                required: true,
+                where: {
+                    libelle: 'valide'
+                }
+            }
+        });
+
+        if (!organization) {
+            return res.status(404).json({
+                status: 'failure',
+                message: 'L\'organisation avec cet email n\'existe pas ou n\'est pas validée. Veuillez contacter la DRIPS ou lesupport au support@justice.bj'
+            });
+        }
+
+        // Générer et stocker le code OTP
+        const otpCode = await utils.generateAndStoreOTP(email); // Assume this function generates and stores the OTP code
+
+        const params = {
+            otp: otpCode
+        }
+        const type = "sendOtpCode";
+        const mailOptions = {
+            to: organization.email,
+            subject: "Code de connexion"
+        }
+        sendEmail(mailOptions, params, type);
+        return res.status(200).json({
+            status: 'success',
+            message: 'Un code OTP a été envoyé à votre email.'
+        });
+    } catch (error) {
+        console.error('Erreur lors de l\'envoi du code OTP:', error);
+        return res.status(500).json({
+            status: 'failure',
+            message: 'Une erreur est survenue lors du traitement de votre demande.'
+        });
+    }
+};
+
+
+const check_otp_code = async (req, res) => {
+    try {
+        const email = req.body.email;
+        const code = req.body.otp;
+        let data = null;
+        console.log(email, code)
+        if(!email || !code) return res.status(200).json({status: "failure", message: "Les champs email et otp sont réquis" })
+        const codeOtp = await db.CodeOTP.findOne({
+            where: { email, code }
+        });
+
+        if (!codeOtp) {
+            return res.status(404).json({
+                status: 'failure',
+                message: 'Le code OTP est invalide ou a expiré.'
+            });
+        }
+        data = codeOtp
+        // Vérifier si l'email de l'organisation existe
+        const organization = await db.Organisation.findOne({
+            where: { email },
+            include: {
+                model: db.Status,
+                as: 'statutIn',
+                required: true,
+                where: {
+                    libelle: 'valide'
+                }
+            }
+        });
+
+        if (!organization) {
+            return res.status(404).json({
+                status: 'failure',
+                message: 'L\'organisation associée à cet email n\'existe pas ou n\'est pas validée.'
+            });
+        }
+        // await db.CodeOTP.destroy({
+        //     where: {
+        //         id: codeOtp.id
+        //     }
+        // })
+        return res.status(200).json({
+            status: 'success',
+            message: 'Le code OTP a été vérifié avec succès.',
+            data
+        });
+    } catch (error) {
+        console.error('Erreur lors de la vérification du code OTP:', error);
+        return res.status(500).json({
+            status: 'failure',
+            message: 'Une erreur est survenue lors du traitement de votre demande. Veuillez réessayer plus tard.'
+        });
+    }
+};
+
+const registerOrg = async (req, res) => {
+    console.log("In registreering: ", req.body);
+    try {
+        let t = await db.sequelize.transaction(); // Start transaction
+        let { email, password, password_confirmation, secret, type } = req.body;
+
+        // Simple validation for demonstration
+        if (!email || !password  || !password_confirmation  || !secret || !type) {
+            return res.status(400).json({ status: 'failure', message: 'Tous les champs sont requis.' });
+        }
+        let Model = null;
+        if(type == "login-code"){
+            Model = db.LoginCode;
+        }else if(type == "otp-code"){
+            Model = db.CodeOTP;
+        }else{
+            return res.status(400).json({ status: "failure", message: "Le type n'est pas correct" })
+        }
+
+        let codeExist = await Model.findOne({
+            where: {
+                email,
+                secret
+            }
+        });
+    
+        if(!codeExist)  return res.status(400).json({status: "failure", message: "Le code a expiré ou n'existe pas."})
+
+        let organisation = await  db.Organisation.findOne({
+            where: {
+                email,
+                disabled: false
+            }
+        })
+
+        if(!organisation)  return res.status(400).json({status: "failure", message: "L'organisation n'existe pas"})
+
+        const role = await db.Role.findOne({ 
+            where: {
+                id:  3
+            }
+        }, { transaction: t });
+        
+        console.log("Verifying Password");
+        if(password != password_confirmation) return res.status(400).json({ status: "failure", message: "Mot de passe pas confirmé" })
+        console.log("Verifying Mail domain");
+        //if(!utils.isGouvBjEmail(email)) return res.status(400).send("Email doit être '*.gouv.bj'")
+  
+        console.log("Getting userCentre");
+        let user = await User.findOne({ where: {
+                [Op.and]:     [
+                    { email: email }
+                ]
+            }
+        });
+        console.log("role.label", role.label);
+        //console.log(centreID,user.id, user.email, user.centreID);
+        if(user){
+            console.log('Mail déjà pris ou ...')
+            return res.status(400).json({status: "failure", message: "Organisation a déjà un compte"});
+        }
+
+        
+        const saltPass = await bcrypt.genSalt(12);
+        const hashPwd = await bcrypt.hash(password,saltPass)
+        //console.log(hashPwd)
+        User.create({
+            nom: organisation.name,
+            prenoms: organisation.name,
+            email: email,
+            password: hashPwd,
+            tel: organisation.telephone,
+            first_connect: false
+        }).then(async (user) =>{
+            console.log('user created');
+            await user.setRole(role);
+            await role.addUsers(user)
+            console.log('Association with role setted');
+
+            if(organisation != null){
+                console.log('Setting organisation');
+                await user.setOrganisation(organisation);
+            }
+
+            console.log('Association with role setted');
+
+            const result = await loginLogic(email, password);
+
+            if (result.status === "success") {
+                await Model.destroy({
+                    where: {
+                        id: codeExist.id // Use where to specify the condition
+                    }
+                });
+                return res.status(200).json(result);
+            } else {
+                return res.status(result.status === "failure" ? 400 : 500).json(result);
+            }
+        }).catch((error) => {
+            console.log(error)
+            res.status(500).json({status: "failure", message: "Un problème interne. Veuillez patienter."});
+        })
+    } catch (error) {
+            console.log('Error while processing user: '+error)
+            res.status(500).json({status: "failure", message: "Un problème interne. Veuillez patienter."});
+    }
+    
+};
+
+
+
+module.exports = {
+    updateProfileInfo,
+    registerUser,
+    login,
+    updateProfilePassword,
+    logout,
+    viewAllUsers,
+    viewUser,
+    ableUser,
+    disableUser,
+    updateUserByAdmin,
+    restoreUserPassword,
+    handleToken,
+    check_login_code,
+    registerOrg,
+    send_otp,
+    check_otp_code,
+    getRoles
+};
